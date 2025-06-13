@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 from matplotlib.patches import Ellipse
@@ -155,31 +154,26 @@ def assign_func(assign_params, index, toas, pos):
     return signal
 
 
-def loop_func(angnum, psrs, thetas, phis, white_sigma, folder, calc_snr):
+def loop_func(angnum, psrs, params_dict, white_sigma, folder, calc_snr):
     """
     Calculates the posterior mean and covariance of gravitational wave (GW) parameters
     at a given sky location using a linearized (Gaussian) model approximation.
-    (Optional) Computes the approximate signal-to-noise ratio (SNR^2) .
+    Optionally computes the approximate signal-to-noise ratio (SNR²).
 
     Args:
-        angnum (int): Index of the sky pixel (into thetas, phis).
+        angnum (int): Index of the sky pixel (used to select theta and phi).
         psrs (list): List of DummyPsr objects, each representing a pulsar.
-        thetas (np.ndarray): Array of polar angles θ for each pixel.
-        phis (np.ndarray): Array of azimuthal angles φ for each pixel.
+        params_func_dict (dict): Dictionary of GW source parameters.
+                                 Must include 'theta' and 'phi' as lists/arrays.
         white_sigma (float): Standard deviation of white noise [seconds].
         folder (str): Directory to save output files.
         calc_snr (bool): If True, compute and save the squared SNR.
     """
-    # Set GW source parameters for the current pixel (angnum)
-    params_func_dict = {
-        "gwtheta": thetas[angnum],  # GW source polar angle
-        "gwphi": phis[angnum],      # GW source azimuthal angle
-        "inc": 1.0,                 # inclination angle cosine
-        "log10_mc": 9.0,            # log10 of chirp mass
-        "log10_fgw": -8.0,          # log10 of GW frequency
-        "log10_dist": 2.0,          # log10 of distance to GW source
-        "phase0": 1.0,              # initial GW phase
-        "psi": 1.0,                 # polarization angle
+
+    # Update theta and phi in the parameter dictionary using the current sky location index
+    params_func_dict={**params_dict,
+        "gwtheta": params_dict["gwtheta"][angnum],
+        "gwphi": params_dict["gwphi"][angnum]
     }
 
     sigpsrs = []
@@ -200,13 +194,13 @@ def loop_func(angnum, psrs, thetas, phis, white_sigma, folder, calc_snr):
         sigpsr = jax.vmap(assign_index)(jnp.arange(len(psr.toas)))
         sigpsrs.append(sigpsr)
 
-    gradarr = jnp.array(sigpsrs)  # shape: (num_psrs, num_toas, num_params+1)
+    gradarr = jnp.array(sigpsrs)  # shape: (num_psrs, num_params, num_toas)
 
-    # Extract gradients for all but the last TOA (exclude pulsar distance parameter gradients)
+    # Extract gradients for all but the last parameter (exclude pulsar distance parameter gradients)
     grad_e_arrs = [gradarr[i, :-1, :] for i in range(len(psrs))]
     grad_e = jnp.concatenate(grad_e_arrs, axis=1)  # concatenate along TOAs axis
 
-    # Extract gradients for the last TOA (pulsar distance parameter), pad so alignment matches overall shape
+    # Extract gradients for the last parameter (pulsar distance parameter), pad so alignment matches overall shape
     grad_p_arrs = [
         jnp.pad(
             gradarr[i, -1, :],  # gradients for pulsar distance parameter
@@ -217,15 +211,15 @@ def loop_func(angnum, psrs, thetas, phis, white_sigma, folder, calc_snr):
     ]
     grad_p = jnp.array(grad_p_arrs)
 
-    # Combine gradients of extrinsic parameters and pulsar distance parameters into a single array
+    # Combine gradients of common parameters and pulsar distance parameters into a single array
     grads = jnp.concatenate((grad_e, grad_p))
 
     # Collect pulsar distance measurement uncertainties (sigma)
     pdist_sigmas_list = [psr.distance[-1] for psr in psrs]
     pdist_sigmas = jnp.array(pdist_sigmas_list)
 
-    numparams_e = len(params_func_dict)  # number of extrinsic GW parameters
-    # Construct inverse covariance matrix: signal + noise (white noise variance + distance uncertainties)
+    numparams_e = len(params_func_dict)  # number of common GW parameters
+    # Construct inverse covariance matrix of prior
     covinv = (
         jnp.dot(grads, grads.T) / white_sigma**2
         + jnp.diag(jnp.concatenate((jnp.zeros(numparams_e), 1.0 / pdist_sigmas**2)))
@@ -237,10 +231,8 @@ def loop_func(angnum, psrs, thetas, phis, white_sigma, folder, calc_snr):
     # Combine white noise residuals from all pulsars
     noise = jnp.concatenate([psr.whitedata for psr in psrs])
 
-    # Compute weighted sum of noise projected onto gradients
+    # Compute mean
     nhmat = jnp.dot(noise, grads.T) / white_sigma**2
-
-    # Compute mean parameter estimates (including distance sigmas)
     meanjax = covjax @ nhmat + jnp.array(list(params_func_dict.values()) + pdist_sigmas_list)
 
     # Convert to numpy arrays for saving
@@ -282,7 +274,7 @@ def loop_func(angnum, psrs, thetas, phis, white_sigma, folder, calc_snr):
             psr.snr2 = np.sum((gwdata / psr.white_sigma) ** 2)
             snr2s.append(psr.snr2)
 
-        # Save all pulsars' SNR^2 values to a file
+        # Save all pulsars' approximate SNR^2 values to a file
         np.savetxt(f"{folder}/snr2_{angnum}.txt", np.array(snr2s))
 
 
@@ -297,19 +289,22 @@ def prob_chisq(prob):
     # value of the chi-square distribution's quantile for 2 degrees of freedom
     chisqcdf = np.sqrt(-2.0 * np.log(1 - prob))
     return chisqcdf
+
 def get_ellipse_params_from_cov(cov):
     """
     Perform SVD on a 2D covariance matrix to obtain ellipse width, height, and orientation angle.
 
     Args:
-        cov (np.ndarray): 2×2 covariance matrix.
+        cov (np.ndarray): 2 times 2 covariance matrix.
 
     Returns:
         tuple: (width, height, angle_in_degrees)
     """
     U, s, _ = linalg.svd(cov)
     orientation = np.atan2(U[1, 0], U[0, 0])  # orientation in radians
-    width = np.sqrt(s[0])
-    height = np.sqrt(s[1])
+    width = 2.0 * np.sqrt(s[0])
+    height = 2.0 * np.sqrt(s[1])
     angle = np.degrees(orientation)
+    if height > width:
+        raise ValueError('width must be greater than height')
     return width, height, angle
