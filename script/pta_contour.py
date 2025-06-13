@@ -4,7 +4,9 @@ from matplotlib.patches import Ellipse
 from scipy import linalg
 import jax
 import jax.numpy as jnp
+import mpmath as mp
 import deterministic_jnp
+
 
 class DummyPsr:
     def __init__(
@@ -287,8 +289,8 @@ def ang_rot(phi, theta):
 def prob_chisq(prob):
     # Convert a cumulative probability to the corresponding
     # value of the chi-square distribution's quantile for 2 degrees of freedom
-    chisqcdf = np.sqrt(-2.0 * np.log(1 - prob))
-    return chisqcdf
+    chisqcdf = mp.sqrt(-mp.mpf("2.0") * mp.log(mp.mpf("1.0") - prob))
+    return np.array(chisqcdf,np.float64)
 
 def get_ellipse_params_from_cov(cov):
     """
